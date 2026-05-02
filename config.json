@@ -1,0 +1,9 @@
+{
+  "accounts": [
+    "zuck",
+    "mosseri"
+  ],
+  "headless": true,
+  "timeout_ms": 60000,
+  "between_request_delay_ms": 1500
+}
