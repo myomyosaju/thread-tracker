@@ -69,6 +69,15 @@ def latest_two_days(df: pd.DataFrame) -> pd.DataFrame:
     return latest
 
 
+def follower_rank_on(daily: pd.DataFrame, on_date, username: str) -> int | None:
+    """1-based rank by followers (desc) on a given date. None if user absent."""
+    snap = daily[daily["date"] == on_date].copy()
+    if snap.empty or username not in snap["username"].values:
+        return None
+    snap = snap.sort_values("followers", ascending=False).reset_index(drop=True)
+    return int(snap.index[snap["username"] == username][0]) + 1
+
+
 def classify_trend(my_delta: float | None, comp_delta_avg: float | None) -> tuple[str, str]:
     """Return (badge_emoji_label, explanation) based on me vs competitors."""
     if my_delta is None or comp_delta_avg is None or pd.isna(my_delta) or pd.isna(comp_delta_avg):
@@ -137,12 +146,37 @@ latest = latest_two_days(df)
 my_row = latest[latest["username"] == my_account].iloc[0] if my_account else None
 competitors = latest[latest["username"] != my_account].copy()
 
+daily_all = daily_latest(df)
+latest_date = daily_all["date"].max()
+prev_dates = sorted(d for d in daily_all["date"].unique() if d < latest_date)
+prev_date = prev_dates[-1] if prev_dates else None
+
+current_rank = follower_rank_on(daily_all, latest_date, my_account) if my_account else None
+prev_rank = (
+    follower_rank_on(daily_all, prev_date, my_account)
+    if my_account and prev_date is not None
+    else None
+)
+total_accounts = int(daily_all[daily_all["date"] == latest_date]["username"].nunique())
+
+leader_row = None
+gap_to_leader = None
+if my_account:
+    snap = daily_all[daily_all["date"] == latest_date].sort_values(
+        "followers", ascending=False
+    )
+    if not snap.empty:
+        leader_row = snap.iloc[0]
+        if leader_row["username"] != my_account:
+            my_followers_now = int(my_row["followers"]) if my_row is not None else 0
+            gap_to_leader = int(leader_row["followers"]) - my_followers_now
+
 # ─────────────────────────── 1. 내 계정 섹션 ───────────────────────────
 st.markdown("## 🎯 내 계정")
 if my_row is None:
     st.info("config.json에 `my_account`를 설정하세요.")
 else:
-    c1, c2, c3, c4 = st.columns([1.2, 1, 1, 1.8])
+    c1, c2, c3 = st.columns(3)
     with c1:
         st.metric(
             label=f"@{my_account} 현재 팔로워",
@@ -160,11 +194,42 @@ else:
             st.metric("증감률", "—")
     with c3:
         st.metric("최신 기록일", str(my_row["date"]))
-    with c4:
+
+    r1, r2, r3 = st.columns(3)
+    with r1:
+        if current_rank is not None:
+            if prev_rank is not None and prev_rank != current_rank:
+                # 순위는 숫자가 작을수록 높음 → 숫자 감소 = 상승
+                move = prev_rank - current_rank
+                arrow = "↑" if move > 0 else "↓"
+                rank_delta = f"전일 대비 {arrow}{abs(move)}"
+            elif prev_rank is not None:
+                rank_delta = "전일 대비 —"
+            else:
+                rank_delta = None
+            st.metric(
+                "시장 내 순위 (팔로워 기준)",
+                f"전체 {total_accounts}명 중 {current_rank}위",
+                delta=rank_delta,
+                delta_color=("normal" if prev_rank is None or prev_rank == current_rank else "normal"),
+            )
+        else:
+            st.metric("시장 내 순위 (팔로워 기준)", "—")
+    with r2:
+        if leader_row is not None and leader_row["username"] == my_account:
+            st.metric("1위와의 격차", "🏆 1위입니다")
+        elif gap_to_leader is not None and leader_row is not None:
+            st.metric(
+                f"1위 @{leader_row['username']} 대비",
+                f"-{gap_to_leader:,}명",
+            )
+        else:
+            st.metric("1위와의 격차", "—")
+    with r3:
         if not competitors.empty and pd.notna(my_row["delta"]):
             sorted_all = latest.sort_values("delta", ascending=False, na_position="last").reset_index(drop=True)
-            rank = sorted_all.index[sorted_all["username"] == my_account][0] + 1
-            st.metric("증감 순위 (전체 중)", f"{rank} / {len(latest)} 위")
+            growth_rank = sorted_all.index[sorted_all["username"] == my_account][0] + 1
+            st.metric("증감 순위 (전체 중)", f"{growth_rank} / {len(latest)} 위")
         else:
             st.metric("증감 순위 (전체 중)", "—")
 
