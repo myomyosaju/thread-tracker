@@ -1,8 +1,26 @@
 {
   "accounts": [
-    "zuck",
-    "mosseri"
+    "know.youngwoo",
+    "choi.jihye.ceo",
+    "edu_signal",
+    "chipguide",
+    "jasoseo_king",
+    "master_chopd",
+    "jjeon_ki__",
+    "narae_is_consulting",
+    "j_positioning",
+    "catch.job",
+    "interview__k",
+    "job_jin_coach",
+    "engineering.mentor",
+    "allkill.binn",
+    "in_ba_hab",
+    "jobandkill",
+    "jasoseohero",
+    "harihari747474",
+    "allpass_everything"
   ],
+  "my_account": "know.youngwoo",
   "headless": true,
   "timeout_ms": 60000,
   "between_request_delay_ms": 1500
