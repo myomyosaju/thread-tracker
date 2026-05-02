@@ -5,6 +5,8 @@ appends a timestamped row to followers_data.csv, and prints the
 day-over-day delta for each account.
 """
 
+from __future__ import annotations
+
 import asyncio
 import csv
 import json
@@ -49,14 +51,16 @@ def parse_count(text: str) -> int:
 
 async def fetch_followers(page, username: str, timeout_ms: int) -> int:
     url = f"https://www.threads.net/@{username}"
+    # 1순위: domcontentloaded — meta는 SSR이라 이 시점이면 이미 들어옴.
     await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
 
     # The meta description on a public Threads profile carries the count
     # in a stable shape, e.g. "@zuck on Threads. 1.2M Followers. ...".
-    # This avoids fragile DOM selectors that change frequently.
+    # 메타 한 번에 시도하고 실패하면 짧은 wait 후 DOM fallback.
+    meta_locator = page.locator('meta[name="description"]')
     try:
-        await page.wait_for_selector('meta[name="description"]', timeout=timeout_ms)
-        meta = await page.locator('meta[name="description"]').first.get_attribute("content")
+        await meta_locator.first.wait_for(state="attached", timeout=5000)
+        meta = await meta_locator.first.get_attribute("content")
         if meta:
             m = re.search(r"([\d.,]+\s*[KMB]?)\s*Followers", meta, re.I)
             if m:
@@ -67,7 +71,7 @@ async def fetch_followers(page, username: str, timeout_ms: int) -> int:
     except Exception:
         pass
 
-    # Fallback: scan the rendered DOM.
+    # Fallback: scan the rendered DOM (메타가 비어있는 드문 경우).
     body_text = await page.locator("body").inner_text()
     m = re.search(r"([\d.,]+\s*[KMB]?)\s*followers", body_text, re.I)
     if m:
@@ -118,12 +122,37 @@ def format_delta(delta: int) -> str:
     return "±0"
 
 
+async def _fetch_one(
+    context,
+    sem: asyncio.Semaphore,
+    username: str,
+    timeout_ms: int,
+    post_delay_ms: int,
+) -> tuple[str, int | None, str | None]:
+    """세마포어로 동시성 제한, 계정당 새 page를 열고 닫음."""
+    async with sem:
+        page = await context.new_page()
+        try:
+            count = await fetch_followers(page, username, timeout_ms)
+            return username, count, None
+        except Exception as e:
+            return username, None, str(e)
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
+            if post_delay_ms > 0:
+                await asyncio.sleep(post_delay_ms / 1000)
+
+
 async def main() -> int:
     cfg = load_config()
     accounts = cfg.get("accounts", [])
     headless = cfg.get("headless", True)
-    timeout_ms = int(cfg.get("timeout_ms", 60000))
-    delay_ms = int(cfg.get("between_request_delay_ms", 1500))
+    timeout_ms = int(cfg.get("timeout_ms", 30000))
+    delay_ms = int(cfg.get("between_request_delay_ms", 500))
+    concurrency = max(1, int(cfg.get("concurrency", 4)))
 
     if not accounts:
         print("config.json의 accounts 리스트가 비어 있습니다.", file=sys.stderr)
@@ -131,7 +160,7 @@ async def main() -> int:
 
     previous = load_previous_counts()
     run_at = datetime.now()
-    results: list[tuple[str, int | None, str | None]] = []
+    started = asyncio.get_event_loop().time()
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=headless)
@@ -140,22 +169,26 @@ async def main() -> int:
             locale="en-US",
             extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
         )
-        page = await context.new_page()
+        sem = asyncio.Semaphore(concurrency)
         try:
-            for i, username in enumerate(accounts):
-                try:
-                    followers = await fetch_followers(page, username, timeout_ms)
-                    append_row(run_at, username, followers)
-                    results.append((username, followers, None))
-                except Exception as e:
-                    results.append((username, None, str(e)))
-                if i < len(accounts) - 1 and delay_ms > 0:
-                    await asyncio.sleep(delay_ms / 1000)
+            results = await asyncio.gather(
+                *(_fetch_one(context, sem, u, timeout_ms, delay_ms) for u in accounts)
+            )
         finally:
             await context.close()
             await browser.close()
 
-    print(f"\n=== Threads 팔로워 트래커  {run_at:%Y-%m-%d %H:%M:%S} ===")
+    # 모든 결과가 모인 후 한 번에 CSV에 append (단일 스레드라 안전하지만 명시적으로 분리).
+    for username, followers, err in results:
+        if err is None and followers is not None:
+            append_row(run_at, username, followers)
+
+    elapsed = asyncio.get_event_loop().time() - started
+
+    print(
+        f"\n=== Threads 팔로워 트래커  {run_at:%Y-%m-%d %H:%M:%S}  "
+        f"(소요 {elapsed:.1f}s, concurrency={concurrency}) ==="
+    )
     failures = 0
     for username, followers, err in results:
         if err is not None:
