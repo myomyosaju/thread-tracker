@@ -2,7 +2,12 @@ name: Track Threads followers
 
 on:
   schedule:
-    - cron: "0 0 * * *"   # UTC 00:00 = KST 09:00
+    # 무료 플랜 큐 지연 대비로 KST 8:30~10:00 사이 4번 분산 발동.
+    # tracker.py가 "오늘 KST 기준 이미 실행됐으면 skip"을 처리한다.
+    - cron: "30 23 * * *"  # UTC 23:30 = KST 08:30
+    - cron: "0 0 * * *"    # UTC 00:00 = KST 09:00
+    - cron: "30 0 * * *"   # UTC 00:30 = KST 09:30
+    - cron: "0 1 * * *"    # UTC 01:00 = KST 10:00
   workflow_dispatch:        # 수동 실행 버튼
 
 permissions:

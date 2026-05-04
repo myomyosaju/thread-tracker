@@ -4,7 +4,9 @@
       "Bash(python3 -m venv .venv)",
       "Bash(.venv/bin/pip install *)",
       "Bash(.venv/bin/playwright install *)",
-      "Bash(.venv/bin/python *)"
+      "Bash(.venv/bin/python *)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('tracker.py'\\).read\\(\\)\\); print\\('tracker.py syntax OK'\\)\")",
+      "Bash(python3 -c \"import yaml; yaml.safe_load\\(open\\('.github/workflows/track.yml'\\)\\); print\\('track.yml YAML OK'\\)\")"
     ]
   }
 }

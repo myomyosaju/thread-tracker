@@ -14,8 +14,12 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from playwright.async_api import async_playwright
+
+KST = ZoneInfo("Asia/Seoul")
+UTC = ZoneInfo("UTC")
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_FILE = ROOT / "config.json"
@@ -83,6 +87,32 @@ async def fetch_followers(page, username: str, timeout_ms: int) -> int:
     raise RuntimeError(f"follower count not found for @{username}")
 
 
+def already_ran_today_kst() -> bool:
+    """CSV 마지막 행의 timestamp가 오늘 KST 날짜와 같으면 True.
+
+    Actions 환경에서 naive `datetime.now()`는 UTC이므로 CSV의 naive 타임스탬프를
+    UTC로 해석해 KST 날짜로 환산한다. 이렇게 해야 KST 09:00 부근의 분산 실행
+    중 첫 성공 이후 같은 날 다른 schedule이 발동해도 정확히 skip된다.
+    """
+    if not CSV_FILE.exists():
+        return False
+    last_ts: datetime | None = None
+    with CSV_FILE.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                ts = datetime.fromisoformat(row["timestamp"])
+            except (KeyError, ValueError):
+                continue
+            if last_ts is None or ts > last_ts:
+                last_ts = ts
+    if last_ts is None:
+        return False
+    if last_ts.tzinfo is None:
+        last_ts = last_ts.replace(tzinfo=UTC)
+    return last_ts.astimezone(KST).date() == datetime.now(KST).date()
+
+
 def load_previous_counts() -> dict[str, tuple[datetime, int]]:
     """Most recent record per user from a date strictly before today."""
     if not CSV_FILE.exists():
@@ -147,6 +177,10 @@ async def _fetch_one(
 
 
 async def main() -> int:
+    if already_ran_today_kst():
+        print(f"오늘({datetime.now(KST).date()} KST) 이미 실행됨 — skip")
+        return 0
+
     cfg = load_config()
     accounts = cfg.get("accounts", [])
     headless = cfg.get("headless", True)
