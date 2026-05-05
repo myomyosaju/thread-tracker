@@ -23,6 +23,7 @@
   "my_account": "know.youngwoo",
   "headless": true,
   "timeout_ms": 30000,
-  "between_request_delay_ms": 500,
+  "delay_min_ms": 1000,
+  "delay_max_ms": 3000,
   "concurrency": 4
 }

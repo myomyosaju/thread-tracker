@@ -2,12 +2,16 @@ name: Track Threads followers
 
 on:
   schedule:
-    # 무료 플랜 큐 지연 대비로 KST 8:30~10:00 사이 4번 분산 발동.
-    # tracker.py가 "오늘 KST 기준 이미 실행됐으면 skip"을 처리한다.
-    - cron: "30 23 * * *"  # UTC 23:30 = KST 08:30
-    - cron: "0 0 * * *"    # UTC 00:00 = KST 09:00
-    - cron: "30 0 * * *"   # UTC 00:30 = KST 09:30
-    - cron: "0 1 * * *"    # UTC 01:00 = KST 10:00
+    # 3시간마다 실행 — KST 00, 03, 06, 09, 12, 15, 18, 21시.
+    # GitHub Actions cron은 UTC 기준 → KST -9시간.
+    - cron: "0 15 * * *"  # UTC 15:00 = KST 00:00
+    - cron: "0 18 * * *"  # UTC 18:00 = KST 03:00
+    - cron: "0 21 * * *"  # UTC 21:00 = KST 06:00
+    - cron: "0 0 * * *"   # UTC 00:00 = KST 09:00
+    - cron: "0 3 * * *"   # UTC 03:00 = KST 12:00
+    - cron: "0 6 * * *"   # UTC 06:00 = KST 15:00
+    - cron: "0 9 * * *"   # UTC 09:00 = KST 18:00
+    - cron: "0 12 * * *"  # UTC 12:00 = KST 21:00
   workflow_dispatch:        # 수동 실행 버튼
 
 permissions:

@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 tracker.log
 .DS_Store
+launchd.out.log
+launchd.err.log

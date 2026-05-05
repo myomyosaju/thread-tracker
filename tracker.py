@@ -1,8 +1,8 @@
 """Threads follower tracker.
 
 Visits each account's public Threads profile, extracts the follower count,
-appends a timestamped row to followers_data.csv, and prints the
-day-over-day delta for each account.
+and appends a timestamped row to followers_data.csv. Designed to be run
+multiple times per day (every 3h) so intra-day movement can be plotted.
 """
 
 from __future__ import annotations
@@ -10,16 +10,13 @@ from __future__ import annotations
 import asyncio
 import csv
 import json
+import random
 import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
-from playwright.async_api import async_playwright
-
-KST = ZoneInfo("Asia/Seoul")
-UTC = ZoneInfo("UTC")
+from playwright.async_api import async_playwright, BrowserContext, Page
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_FILE = ROOT / "config.json"
@@ -53,14 +50,12 @@ def parse_count(text: str) -> int:
     raise ValueError(f"unparseable follower text: {text!r}")
 
 
-async def fetch_followers(page, username: str, timeout_ms: int) -> int:
+async def fetch_followers(page: Page, username: str, timeout_ms: int) -> int:
     url = f"https://www.threads.net/@{username}"
-    # 1순위: domcontentloaded — meta는 SSR이라 이 시점이면 이미 들어옴.
     await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
 
-    # The meta description on a public Threads profile carries the count
-    # in a stable shape, e.g. "@zuck on Threads. 1.2M Followers. ...".
-    # 메타 한 번에 시도하고 실패하면 짧은 wait 후 DOM fallback.
+    # 메타 description은 SSR이라 즉시 채워짐. K/M 단위로만 노출되지만 비로그인 환경에서
+    # 가장 안정적인 신호.
     meta_locator = page.locator('meta[name="description"]')
     try:
         await meta_locator.first.wait_for(state="attached", timeout=5000)
@@ -75,7 +70,7 @@ async def fetch_followers(page, username: str, timeout_ms: int) -> int:
     except Exception:
         pass
 
-    # Fallback: scan the rendered DOM (메타가 비어있는 드문 경우).
+    # Fallback: 렌더링된 DOM (메타가 비어있는 드문 경우).
     body_text = await page.locator("body").inner_text()
     m = re.search(r"([\d.,]+\s*[KMB]?)\s*followers", body_text, re.I)
     if m:
@@ -87,34 +82,8 @@ async def fetch_followers(page, username: str, timeout_ms: int) -> int:
     raise RuntimeError(f"follower count not found for @{username}")
 
 
-def already_ran_today_kst() -> bool:
-    """CSV 마지막 행의 timestamp가 오늘 KST 날짜와 같으면 True.
-
-    Actions 환경에서 naive `datetime.now()`는 UTC이므로 CSV의 naive 타임스탬프를
-    UTC로 해석해 KST 날짜로 환산한다. 이렇게 해야 KST 09:00 부근의 분산 실행
-    중 첫 성공 이후 같은 날 다른 schedule이 발동해도 정확히 skip된다.
-    """
-    if not CSV_FILE.exists():
-        return False
-    last_ts: datetime | None = None
-    with CSV_FILE.open("r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            try:
-                ts = datetime.fromisoformat(row["timestamp"])
-            except (KeyError, ValueError):
-                continue
-            if last_ts is None or ts > last_ts:
-                last_ts = ts
-    if last_ts is None:
-        return False
-    if last_ts.tzinfo is None:
-        last_ts = last_ts.replace(tzinfo=UTC)
-    return last_ts.astimezone(KST).date() == datetime.now(KST).date()
-
-
 def load_previous_counts() -> dict[str, tuple[datetime, int]]:
-    """Most recent record per user from a date strictly before today."""
+    """Most recent record per user from a date strictly before today (local)."""
     if not CSV_FILE.exists():
         return {}
     today = datetime.now().date()
@@ -153,13 +122,14 @@ def format_delta(delta: int) -> str:
 
 
 async def _fetch_one(
-    context,
+    context: BrowserContext,
     sem: asyncio.Semaphore,
     username: str,
     timeout_ms: int,
-    post_delay_ms: int,
+    delay_min_ms: int,
+    delay_max_ms: int,
 ) -> tuple[str, int | None, str | None]:
-    """세마포어로 동시성 제한, 계정당 새 page를 열고 닫음."""
+    """세마포어로 동시성 제한, 계정당 새 page를 열고 닫음. 작업 후 랜덤 딜레이."""
     async with sem:
         page = await context.new_page()
         try:
@@ -172,20 +142,19 @@ async def _fetch_one(
                 await page.close()
             except Exception:
                 pass
-            if post_delay_ms > 0:
-                await asyncio.sleep(post_delay_ms / 1000)
+            lo = max(0, delay_min_ms)
+            hi = max(lo, delay_max_ms)
+            if hi > 0:
+                await asyncio.sleep(random.uniform(lo, hi) / 1000)
 
 
 async def main() -> int:
-    if already_ran_today_kst():
-        print(f"오늘({datetime.now(KST).date()} KST) 이미 실행됨 — skip")
-        return 0
-
     cfg = load_config()
     accounts = cfg.get("accounts", [])
     headless = cfg.get("headless", True)
     timeout_ms = int(cfg.get("timeout_ms", 30000))
-    delay_ms = int(cfg.get("between_request_delay_ms", 500))
+    delay_min_ms = int(cfg.get("delay_min_ms", cfg.get("between_request_delay_ms", 500)))
+    delay_max_ms = int(cfg.get("delay_max_ms", max(delay_min_ms, 1500)))
     concurrency = max(1, int(cfg.get("concurrency", 4)))
 
     if not accounts:
@@ -206,13 +175,15 @@ async def main() -> int:
         sem = asyncio.Semaphore(concurrency)
         try:
             results = await asyncio.gather(
-                *(_fetch_one(context, sem, u, timeout_ms, delay_ms) for u in accounts)
+                *(
+                    _fetch_one(context, sem, u, timeout_ms, delay_min_ms, delay_max_ms)
+                    for u in accounts
+                )
             )
         finally:
             await context.close()
             await browser.close()
 
-    # 모든 결과가 모인 후 한 번에 CSV에 append (단일 스레드라 안전하지만 명시적으로 분리).
     for username, followers, err in results:
         if err is None and followers is not None:
             append_row(run_at, username, followers)
