@@ -10,9 +10,13 @@ from __future__ import annotations
 import json
 from datetime import timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
+
+KST = ZoneInfo("Asia/Seoul")
+UTC = ZoneInfo("UTC")
 
 ROOT = Path(__file__).resolve().parent
 CSV_FILE = ROOT / "followers_data.csv"
@@ -35,15 +39,41 @@ def load_config(path: Path) -> dict:
 
 @st.cache_data(ttl=300)
 def load_data(path: Path) -> pd.DataFrame:
+    """CSV를 읽고 timestamp를 KST 기준 naive datetime으로 정규화.
+
+    소스 timestamp는 두 종류가 섞일 수 있다:
+      - 로컬 실행 결과: KST naive
+      - GitHub Actions: UTC naive (Ubuntu runner의 시스템 시간)
+    구분이 어려우니 "naive면 UTC로 가정 → KST로 변환"이 현실적으로 가장 안전.
+    Actions가 주된 데이터 소스라는 가정이 깔려 있다. tz-aware ISO 문자열은 그대로 변환.
+    """
     if not path.exists():
-        return pd.DataFrame(columns=["timestamp", "username", "followers"])
+        return pd.DataFrame(columns=["timestamp", "username", "followers", "date"])
     df = pd.read_csv(path)
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    ts = pd.to_datetime(df["timestamp"], errors="coerce")
+    if ts.dt.tz is None:
+        ts = ts.dt.tz_localize(UTC)
+    df["timestamp"] = ts.dt.tz_convert(KST).dt.tz_localize(None)
     df["followers"] = pd.to_numeric(df["followers"], errors="coerce")
-    df = df.dropna(subset=["followers"])
+    df = df.dropna(subset=["timestamp", "followers"])
     df["followers"] = df["followers"].astype(int)
     df["date"] = df["timestamp"].dt.date
-    return df.sort_values("timestamp")
+    return df.sort_values("timestamp").reset_index(drop=True)
+
+
+def hourly_pivot(df_day: pd.DataFrame) -> pd.DataFrame:
+    """행=계정, 열='HH:MM' (KST), 값=팔로워 수 — 빈 셀은 NaN."""
+    if df_day.empty:
+        return pd.DataFrame()
+    d = df_day.copy()
+    # 같은 분 내 중복 기록은 마지막 값으로 정리.
+    d["slot"] = d["timestamp"].dt.strftime("%H:%M")
+    pivot = d.pivot_table(
+        index="username", columns="slot", values="followers", aggfunc="last"
+    )
+    # 컬럼은 시간 순으로 정렬.
+    pivot = pivot.reindex(sorted(pivot.columns), axis=1)
+    return pivot
 
 
 def daily_latest(df: pd.DataFrame) -> pd.DataFrame:
@@ -298,38 +328,104 @@ with i2:
 
 st.divider()
 
-# ─────────────────────────── 3. 경쟁자 비교 테이블 ───────────────────────────
-st.markdown("## 🥊 경쟁자 비교")
-if competitors.empty:
-    st.info("경쟁자 데이터가 아직 없습니다.")
+# ─────────────────────────── 3. 경쟁자 비교 (시간별 피벗) ───────────────────────────
+st.markdown("## 🥊 경쟁자 비교 — 시간별")
+
+available_dates = sorted(df["date"].unique(), reverse=True)
+if not available_dates:
+    st.info("표시할 날짜가 없습니다.")
 else:
-    table = competitors[
-        [
-            "username",
-            "현재 팔로워",
-            "24h 전 팔로워",
-            "24h 증감",
-            "24h 증감률(%)",
-            "오늘 변화",
-            "최신 시각",
-        ]
-    ].rename(columns={"username": "계정"})
-    table = table.sort_values("24h 증감", ascending=False, na_position="last").reset_index(
-        drop=True
+    # 날짜 셀렉터 — 기본값 = 가장 최신 날짜(=오늘 KST)
+    label_for = lambda d: d.strftime("%Y-%m-%d (%a)")
+    selected_date = st.selectbox(
+        "날짜 선택 (KST)",
+        available_dates,
+        index=0,
+        format_func=label_for,
+        key="hourly_date",
     )
-    st.dataframe(
-        table,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "현재 팔로워": st.column_config.NumberColumn(format="%d"),
-            "24h 전 팔로워": st.column_config.NumberColumn(format="%d"),
-            "24h 증감": st.column_config.NumberColumn(format="%+d"),
-            "24h 증감률(%)": st.column_config.NumberColumn(format="%+.2f%%"),
-            "오늘 변화": st.column_config.NumberColumn(format="%+d"),
-            "최신 시각": st.column_config.DatetimeColumn(format="MM-DD HH:mm"),
-        },
+    st.caption(
+        f"선택한 날짜에 크롤링된 시간 슬롯이 컬럼으로 펼쳐집니다. "
+        f"빈 칸은 그 시간에 수집되지 않았음을 의미합니다."
     )
+
+    day_df = df[df["date"] == selected_date]
+    if day_df.empty:
+        st.info(f"{label_for(selected_date)}에 수집된 데이터가 없습니다.")
+    else:
+        pivot = hourly_pivot(day_df)
+
+        # "오늘 변화" = 그 날 첫 기록 → 마지막 기록의 차이
+        first_last = (
+            day_df.sort_values("timestamp")
+            .groupby("username")["followers"]
+            .agg(["first", "last"])
+        )
+        first_last["오늘 변화"] = (first_last["last"] - first_last["first"]).astype("Int64")
+
+        table = pivot.join(first_last["오늘 변화"], how="left")
+
+        # 정렬: 가장 늦은 시간 슬롯의 팔로워 수 내림차순.
+        time_cols = [c for c in table.columns if c != "오늘 변화"]
+        if time_cols:
+            sort_col = time_cols[-1]
+            # NaN(=그 시간 미수집) 계정도 안전하게 정렬.
+            table = table.sort_values(sort_col, ascending=False, na_position="last")
+        table = table.reset_index().rename(columns={"username": "계정"})
+
+        # "🎯 나" 마커 + 정수 컬럼 포맷.
+        if my_account:
+            table["계정"] = table["계정"].apply(
+                lambda u: f"🎯 @{u}" if u == my_account else f"@{u}"
+            )
+
+        column_config = {
+            "오늘 변화": st.column_config.NumberColumn("오늘 변화", format="%+d"),
+        }
+        for c in time_cols:
+            column_config[c] = st.column_config.NumberColumn(c, format="%d")
+
+        st.dataframe(
+            table,
+            use_container_width=True,
+            hide_index=True,
+            column_config=column_config,
+        )
+
+        # 보조: 24h 슬라이딩 윈도우 요약(선택한 날짜의 마지막 기록 기준)을 별도 expander로.
+        with st.expander("24h 슬라이딩 비교 (선택 날짜의 최신 시점 기준)"):
+            day_latest_ts = day_df["timestamp"].max()
+            cmp_table = (
+                comparison_table(df, my_account, day_latest_ts, selected_date)
+                .loc[lambda x: x["username"] != my_account if my_account else slice(None)]
+                [
+                    [
+                        "username",
+                        "현재 팔로워",
+                        "24h 전 팔로워",
+                        "24h 증감",
+                        "24h 증감률(%)",
+                        "오늘 변화",
+                        "최신 시각",
+                    ]
+                ]
+                .rename(columns={"username": "계정"})
+                .sort_values("24h 증감", ascending=False, na_position="last")
+                .reset_index(drop=True)
+            )
+            st.dataframe(
+                cmp_table,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "현재 팔로워": st.column_config.NumberColumn(format="%d"),
+                    "24h 전 팔로워": st.column_config.NumberColumn(format="%d"),
+                    "24h 증감": st.column_config.NumberColumn(format="%+d"),
+                    "24h 증감률(%)": st.column_config.NumberColumn(format="%+.2f%%"),
+                    "오늘 변화": st.column_config.NumberColumn(format="%+d"),
+                    "최신 시각": st.column_config.DatetimeColumn(format="MM-DD HH:mm"),
+                },
+            )
 
 st.divider()
 
@@ -371,74 +467,63 @@ else:
 
 st.divider()
 
-# ─────────────────────────── 5. 그래프: 일별 나 vs 평균 ───────────────────────────
-st.markdown("## 📈 일별 추이 — 나 vs 경쟁자 평균")
+# ─────────────────────────── 5. 시장 추세 (수치 요약) ───────────────────────────
+st.markdown("## 🌐 전체 컨설턴트 시장 추세")
+
 daily = daily_latest(df)
-if my_account:
-    me_series = (
-        daily[daily["username"] == my_account]
-        .set_index("date")["followers"]
-        .rename(f"@{my_account}")
-    )
-    comp_avg_series = (
-        daily[daily["username"] != my_account]
-        .groupby("date")["followers"]
-        .mean()
-        .round(0)
-        .rename("경쟁자 평균")
-    )
-    if not me_series.empty and not comp_avg_series.empty:
-        compare_daily = pd.concat([me_series, comp_avg_series], axis=1).sort_index()
-        g1, g2 = st.columns(2)
-        with g1:
-            st.markdown("**절대값 추이**")
-            st.line_chart(compare_daily, height=320, use_container_width=True)
-        with g2:
-            st.markdown("**상대 추이 (첫날 = 100)**")
-            normalized = compare_daily.div(compare_daily.iloc[0]).mul(100).round(2)
-            st.line_chart(normalized, height=320, use_container_width=True)
-    else:
-        st.info("일별 비교 그래프를 그릴 데이터가 부족합니다.")
-
-st.divider()
-
-# ─────────────────────────── 6. 그래프: 시장 추세 ───────────────────────────
-st.markdown("## 🌐 전체 컨설턴트 시장 추세 (일별)")
-st.caption("모든 계정의 일자별 평균·중앙값·합계를 봐서 다 같이 빠지는지 / 나만 빠지는지 판단합니다.")
-
 market = (
     daily.groupby("date")
-    .agg(평균=("followers", "mean"), 중앙값=("followers", "median"), 합계=("followers", "sum"))
+    .agg(평균=("followers", "mean"), 합계=("followers", "sum"))
     .round(0)
     .sort_index()
 )
 
-m1, m2 = st.columns([2, 1])
-with m1:
-    st.markdown("**시장 평균 / 중앙값**")
-    st.line_chart(market[["평균", "중앙값"]], height=320, use_container_width=True)
-with m2:
-    if len(market) >= 2:
-        latest_avg = market["평균"].iloc[-1]
-        prev_avg = market["평균"].iloc[-2]
-        st.metric(
-            "시장 평균 팔로워 (전일 대비)",
-            f"{int(latest_avg):,}",
-            delta=f"{int(latest_avg - prev_avg):+,}",
-        )
-        latest_sum = market["합계"].iloc[-1]
-        prev_sum = market["합계"].iloc[-2]
-        st.metric(
-            "시장 합계 팔로워 (전일 대비)",
-            f"{int(latest_sum):,}",
-            delta=f"{int(latest_sum - prev_sum):+,}",
-        )
-        ups = int((competitors["24h 증감"] > 0).sum())
-        downs = int((competitors["24h 증감"] < 0).sum())
-        flats = int((competitors["24h 증감"] == 0).sum())
-        st.caption(f"경쟁자 24h 변화: ↑{ups} / ↓{downs} / ─{flats}")
+if len(market) < 2:
+    st.info("시장 추세는 최소 2일치 기록이 쌓이면 표시됩니다.")
+else:
+    latest_avg = float(market["평균"].iloc[-1])
+    prev_avg = float(market["평균"].iloc[-2])
+    latest_sum = float(market["합계"].iloc[-1])
+    prev_sum = float(market["합계"].iloc[-2])
+    avg_delta = latest_avg - prev_avg
+    avg_delta_pct = (avg_delta / prev_avg * 100) if prev_avg else 0.0
+
+    # 한 줄 요약: 24h 슬라이딩으로 본 경쟁자(나 제외) 분포 — 다같이↑/↓/혼조세
+    deltas = competitors["24h 증감"].dropna()
+    n = len(deltas)
+    ups = int((deltas > 0).sum())
+    downs = int((deltas < 0).sum())
+    flats = int((deltas == 0).sum())
+
+    if n == 0:
+        verdict = "⏳ 데이터 부족 — 24시간이 지나야 분포가 나옵니다."
     else:
-        st.info("시장 추세는 최소 2일치 기록이 쌓이면 표시됩니다.")
+        up_ratio = ups / n
+        down_ratio = downs / n
+        if up_ratio >= 0.7:
+            verdict = f"🚀 **다같이 증가 중** — 경쟁자 {n}명 중 {ups}명이 상승 ({up_ratio:.0%})."
+        elif down_ratio >= 0.7:
+            verdict = f"🌧️ **다같이 감소 중** — 경쟁자 {n}명 중 {downs}명이 하락 ({down_ratio:.0%})."
+        else:
+            verdict = (
+                f"🌗 **혼조세** — 경쟁자 {n}명 중 ↑{ups} / ↓{downs} / ─{flats}. "
+                "시장 신호가 한 방향이 아닙니다."
+            )
+
+    s1, s2, s3, s4 = st.columns(4)
+    with s1:
+        st.metric("전체 평균 팔로워 (현재)", f"{int(latest_avg):,}")
+    with s2:
+        st.metric("전체 합계 팔로워 (현재)", f"{int(latest_sum):,}")
+    with s3:
+        st.metric("전일 대비 평균 증감", f"{int(avg_delta):+,}")
+    with s4:
+        st.metric("전일 대비 평균 증감률", f"{avg_delta_pct:+.2f}%")
+
+    st.markdown(verdict)
+    st.caption(
+        f"기준: 일자별 마지막 기록.  최신일={market.index[-1]}  ·  전일={market.index[-2]}"
+    )
 
 with st.expander("원본 데이터 보기"):
     st.dataframe(
