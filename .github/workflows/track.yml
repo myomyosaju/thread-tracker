@@ -41,8 +41,28 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
+      # Threads 로그인 세션을 run 사이에 재사용해 매번 로그인 → 봇 감지 위험을 줄인다.
+      # restore-keys로 가장 최근 캐시를 복원하고, 새 키로 갱신 저장.
+      - name: Restore Threads session
+        uses: actions/cache/restore@v4
+        with:
+          path: storage_state.json
+          key: threads-session-${{ github.run_id }}
+          restore-keys: |
+            threads-session-
+
       - name: Run tracker
+        env:
+          THREADS_USERNAME: ${{ secrets.THREADS_USERNAME }}
+          THREADS_PASSWORD: ${{ secrets.THREADS_PASSWORD }}
         run: python tracker.py
+
+      - name: Save Threads session
+        if: always() && hashFiles('storage_state.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: storage_state.json
+          key: threads-session-${{ github.run_id }}
 
       - name: Commit & push if CSV changed
         run: |

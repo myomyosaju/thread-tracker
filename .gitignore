@@ -5,3 +5,5 @@ tracker.log
 .DS_Store
 launchd.out.log
 launchd.err.log
+.env
+storage_state.json
